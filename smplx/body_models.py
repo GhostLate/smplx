@@ -14,9 +14,13 @@
 #
 # Contact: ps-license@tuebingen.mpg.de
 
+import warnings
 import os
 import os.path as osp
 import pickle
+from collections import namedtuple
+from typing import Dict, Optional, Union
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -133,10 +137,10 @@ class SMPL(nn.Module):
         self.batch_size = batch_size
         shapedirs = data_struct.shapedirs
         if (shapedirs.shape[-1] < self.SHAPE_SPACE_DIM):
-            print(f'WARNING: You are using a {self.name()} model, with only'
-                  f' {shapedirs.shape[-1]} shape coefficients.\n'
-                  f'num_betas={num_betas}, shapedirs.shape={shapedirs.shape}, '
-                  f'self.SHAPE_SPACE_DIM={self.SHAPE_SPACE_DIM}')
+            warnings.warn(f'WARNING: You are using a {self.name()} model, with only'
+                          f' {shapedirs.shape[-1]} shape coefficients.\n'
+                          f'num_betas={num_betas}, shapedirs.shape={shapedirs.shape}, '
+                          f'self.SHAPE_SPACE_DIM={self.SHAPE_SPACE_DIM}')
             num_betas = min(num_betas, shapedirs.shape[-1])
         else:
             num_betas = min(num_betas, self.SHAPE_SPACE_DIM)
@@ -1117,16 +1121,15 @@ class SMPLX(SMPLH):
             shapedirs = shapedirs[:, :, None]
         if (shapedirs.shape[-1] < self.SHAPE_SPACE_DIM +
                 self.EXPRESSION_SPACE_DIM):
-            print(f'WARNING: You are using a {self.name()} model, with only'
-                  ' 10 shape and 10 expression coefficients.')
+            warnings.warn(f'WARNING: You are using a {self.name()} model, with only'
+                          f' 10 shape and 10 expression coefficients.')
             expr_start_idx = 10
             expr_end_idx = 20
             num_expression_coeffs = min(num_expression_coeffs, 10)
         else:
             expr_start_idx = self.SHAPE_SPACE_DIM
             expr_end_idx = self.SHAPE_SPACE_DIM + num_expression_coeffs
-            num_expression_coeffs = min(
-                num_expression_coeffs, self.EXPRESSION_SPACE_DIM)
+            num_expression_coeffs = min(num_expression_coeffs, self.EXPRESSION_SPACE_DIM)
 
         self._num_expression_coeffs = num_expression_coeffs
 
@@ -1166,7 +1169,6 @@ class SMPLX(SMPLH):
                                     leye_pose_mean, reye_pose_mean,
                                     self.left_hand_mean, self.right_hand_mean],
                                    axis=0)
-
         return pose_mean
 
     def extra_repr(self):
@@ -2055,8 +2057,8 @@ class FLAME(SMPL):
             shapedirs = shapedirs[:, :, None]
         if (shapedirs.shape[-1] < self.SHAPE_SPACE_DIM +
                 self.EXPRESSION_SPACE_DIM):
-            print(f'WARNING: You are using a {self.name()} model, with only'
-                  ' 10 shape and 10 expression coefficients.')
+            warnings.warn(f'WARNING: You are using a {self.name()} model, with only '
+                          f'10 shape and 10 expression coefficients.')
             expr_start_idx = 10
             expr_end_idx = 20
             num_expression_coeffs = min(num_expression_coeffs, 10)
