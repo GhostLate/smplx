@@ -18,7 +18,7 @@ from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import division
 
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import numpy as np
 
 import torch
@@ -163,6 +163,7 @@ def lbs(
     parents: Tensor,
     lbs_weights: Tensor,
     pose2rot: bool = True,
+    kin_tree_levels: Optional[Tuple[Tensor, List[int]]] = None,
 ) -> Tuple[Tensor, Tensor]:
     ''' Performs Linear Blend Skinning with the given shape and pose parameters
 
@@ -191,6 +192,9 @@ def lbs(
             matrices. The default value is True. If False, then the pose tensor
             should already contain rotation matrices and have a size of
             Bx(J + 1)x9
+        kin_tree_levels: tuple, optional
+            The output of find_kin_tree_levels(parents). Pass it to avoid
+            recomputing it, and the GPU->CPU copy that implies, on every call
         dtype: torch.dtype, optional
 
         Returns
@@ -232,22 +236,31 @@ def lbs(
 
     v_posed = pose_offsets + v_shaped
     # 4. Get the global joint location
-    J_transformed, A = batch_rigid_transform(rot_mats, J, parents, dtype=dtype)
+    J_transformed, A = batch_rigid_transform(
+        rot_mats, J, parents, dtype=dtype, kin_tree_levels=kin_tree_levels)
 
     # 5. Do skinning:
-    # W is N x V x (J + 1)
-    W = lbs_weights.unsqueeze(dim=0).expand([batch_size, -1, -1])
-    # (N x V x (J + 1)) x (N x (J + 1) x 16)
+    # W is V x (J + 1), shared by the whole batch. Only the top 3 rows of the
+    # transforms are blended, since the last one is always [0, 0, 0, 1]
     num_joints = J_regressor.shape[0]
-    T = torch.matmul(W, A.view(batch_size, num_joints, 16)) \
-        .view(batch_size, -1, 4, 4)
+    A_top = A[:, :, :3].reshape(batch_size, num_joints, 12)
 
     homogen_coord = torch.ones([batch_size, v_posed.shape[1], 1],
                                dtype=dtype, device=device)
     v_posed_homo = torch.cat([v_posed, homogen_coord], dim=2)
-    v_homo = torch.matmul(T, torch.unsqueeze(v_posed_homo, dim=-1))
 
-    verts = v_homo[:, :, :3, 0]
+    # (V x (J + 1)) x (N x (J + 1) x 12) -> N x V x 3 x 4
+    if v_posed.is_cuda:
+        # A single GEMM for the whole batch, and the per-vertex transforms
+        # applied as multiply-sum: as a matmul that is millions of tiny
+        # products, for which cuBLAS picks a very slow kernel
+        T = torch.einsum('vj,bjk->bvk', [lbs_weights, A_top]) \
+            .view(batch_size, -1, 3, 4)
+        verts = (T * v_posed_homo.unsqueeze(dim=-2)).sum(dim=-1)
+    else:
+        # On the CPU the batched matmuls are the faster option
+        T = torch.matmul(lbs_weights, A_top).view(batch_size, -1, 3, 4)
+        verts = torch.matmul(T, v_posed_homo.unsqueeze(dim=-1))[..., 0]
 
     return verts, J_transformed
 
@@ -322,14 +335,17 @@ def batch_rodrigues(
 
     # Bx1 arrays
     rx, ry, rz = torch.split(rot_dir, 1, dim=1)
-    K = torch.zeros((batch_size, 3, 3), dtype=dtype, device=device)
 
     zeros = torch.zeros((batch_size, 1), dtype=dtype, device=device)
     K = torch.cat([zeros, -rz, ry, rz, zeros, -rx, -ry, rx, zeros], dim=1) \
         .view((batch_size, 3, 3))
 
     ident = torch.eye(3, dtype=dtype, device=device).unsqueeze(dim=0)
-    rot_mat = ident + sin * K + (1 - cos) * torch.bmm(K, K)
+    # K @ K in closed form (K is the cross-product matrix of rot_dir), since a
+    # bmm of many 3x3 matrices is slow on the GPU
+    K_sq = rot_dir.unsqueeze(dim=2) * rot_dir.unsqueeze(dim=1) - \
+        (rot_dir * rot_dir).sum(dim=1).view(-1, 1, 1) * ident
+    rot_mat = ident + sin * K + (1 - cos) * K_sq
     return rot_mat
 
 
@@ -346,11 +362,55 @@ def transform_mat(R: Tensor, t: Tensor) -> Tensor:
                       F.pad(t, [0, 0, 0, 1], value=1)], dim=2)
 
 
+def find_kin_tree_levels(parents: Tensor) -> Tuple[Tensor, List[int]]:
+    """
+    Groups the joints of a kinematic tree by their depth, so that
+    batch_rigid_transform can process a whole level with one batched op
+
+    Parameters
+    ----------
+    parents : torch.tensor N
+        The kinematic tree, with parents[0] == -1 for the root and
+        parents[i] < i for all other joints
+
+    Returns
+    -------
+    level_idxs : torch.tensor 3xN
+        Row 0: the joint indices sorted by depth. Row 1: the inverse
+        permutation. Row 2: for each joint in depth order, the position of its
+        parent inside the previous level
+    level_starts : list of int
+        The offset of each level in the depth order, followed by N
+    """
+    parents_list = parents.tolist()
+    num_joints = len(parents_list)
+
+    depth = [0] * num_joints
+    for i in range(1, num_joints):
+        depth[i] = depth[parents_list[i]] + 1
+
+    order = sorted(range(num_joints), key=lambda i: depth[i])
+    inv_order = [0] * num_joints
+    for pos, i in enumerate(order):
+        inv_order[i] = pos
+    level_starts = [sum(d < level for d in depth)
+                    for level in range(max(depth) + 2)]
+    parent_pos = [
+        inv_order[parents_list[i]] - level_starts[depth[i] - 1]
+        if depth[i] > 0 else 0
+        for i in order]
+
+    level_idxs = torch.tensor([order, inv_order, parent_pos],
+                              dtype=torch.long, device=parents.device)
+    return level_idxs, level_starts
+
+
 def batch_rigid_transform(
     rot_mats: Tensor,
     joints: Tensor,
     parents: Tensor,
-    dtype=torch.float32
+    dtype=torch.float32,
+    kin_tree_levels: Optional[Tuple[Tensor, List[int]]] = None,
 ) -> Tensor:
     """
     Applies a batch of rigid transformations to the joints
@@ -365,6 +425,9 @@ def batch_rigid_transform(
         The kinematic tree of each object
     dtype : torch.dtype, optional:
         The data type of the created tensors, the default is torch.float32
+    kin_tree_levels : tuple, optional
+        The output of find_kin_tree_levels(parents). Computed from parents
+        when not given, which costs a GPU->CPU copy if parents is on the GPU
 
     Returns
     -------
@@ -384,15 +447,27 @@ def batch_rigid_transform(
         rot_mats.reshape(-1, 3, 3),
         rel_joints.reshape(-1, 3, 1)).reshape(-1, joints.shape[1], 4, 4)
 
-    transform_chain = [transforms_mat[:, 0]]
-    for i in range(1, parents.shape[0]):
-        # Subtract the joint location at the rest pose
-        # No need for rotation, since it's identity when at rest
-        curr_res = torch.matmul(transform_chain[parents[i]],
-                                transforms_mat[:, i])
+    if kin_tree_levels is None:
+        kin_tree_levels = find_kin_tree_levels(parents)
+    level_idxs, level_starts = kin_tree_levels
+    order, inv_order, parent_pos = level_idxs
+
+    # Walk the tree one level at a time: the joints of a level only depend on
+    # the previous level, so each level is a single batched product. Looping
+    # over the joints and indexing with parents[i] syncs with the GPU per joint
+    transforms_mat = torch.index_select(transforms_mat, 1, order)
+    transform_chain = [transforms_mat[:, :level_starts[1]]]
+    for start, end in zip(level_starts[1:-1], level_starts[2:]):
+        parent_transforms = torch.index_select(
+            transform_chain[-1], 1, parent_pos[start:end])
+        # 4x4 products as broadcast-multiply-sum, because cuBLAS picks a very
+        # slow kernel for the backward of a large batch of tiny matmuls
+        curr_res = (parent_transforms.unsqueeze(-1) *
+                    transforms_mat[:, start:end].unsqueeze(-3)).sum(dim=-2)
         transform_chain.append(curr_res)
 
-    transforms = torch.stack(transform_chain, dim=1)
+    transforms = torch.index_select(
+        torch.cat(transform_chain, dim=1), 1, inv_order)
 
     # The last column of the transformations contains the posed joints
     posed_joints = transforms[:, :, :3, 3]

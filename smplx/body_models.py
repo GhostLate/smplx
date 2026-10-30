@@ -25,7 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .lbs import blend_shapes, find_dynamic_lmk_idx_and_bcoords, lbs, vertices2landmarks
+from .lbs import blend_shapes, find_dynamic_lmk_idx_and_bcoords, find_kin_tree_levels, lbs, vertices2landmarks
 from .utils import Array, FLAMEOutput, MANOOutput, SMPLHOutput, SMPLOutput, SMPLXOutput, Struct, Tensor, find_joint_kin_chain, to_np, to_tensor
 
 from .vertex_ids import vertex_ids as VERTEX_IDS
@@ -255,6 +255,10 @@ class SMPL(nn.Module):
         parents = to_tensor(to_np(data_struct.kintree_table[0])).long()
         parents[0] = -1
         self.register_buffer('parents', parents)
+        # The tree grouped by depth, so that lbs can pose a level at a time
+        level_idxs, self.kin_tree_level_starts = find_kin_tree_levels(parents)
+        self.register_buffer('kin_tree_level_idxs', level_idxs,
+                             persistent=False)
 
         lbs_weights = to_tensor(to_np(data_struct.weights), dtype=dtype)
         self.register_buffer('lbs_weights', lbs_weights)
@@ -266,6 +270,10 @@ class SMPL(nn.Module):
     @property
     def num_expression_coeffs(self):
         return 0
+
+    @property
+    def kin_tree_levels(self):
+        return self.kin_tree_level_idxs, self.kin_tree_level_starts
 
     def create_mean_pose(self, data_struct) -> Tensor:
         pass
@@ -394,7 +402,8 @@ class SMPL(nn.Module):
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
-                               self.lbs_weights, pose2rot=pose2rot)
+                               self.lbs_weights, pose2rot=pose2rot,
+                               kin_tree_levels=self.kin_tree_levels)
 
         joints = self.vertex_joint_selector(vertices, joints)
         # Map the joints to the current dataset
@@ -501,7 +510,8 @@ class SMPLLayer(SMPL):
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights,
-                               pose2rot=False)
+                               pose2rot=False,
+                               kin_tree_levels=self.kin_tree_levels)
 
         joints = self.vertex_joint_selector(vertices, joints)
         # Map the joints to the current dataset
@@ -799,7 +809,8 @@ class SMPLH(SMPL):
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
-                               self.lbs_weights, pose2rot=pose2rot)
+                               self.lbs_weights, pose2rot=pose2rot,
+                               kin_tree_levels=self.kin_tree_levels)
 
         # Add any extra joints that might be needed
         joints = self.vertex_joint_selector(vertices, joints)
@@ -929,7 +940,8 @@ class SMPLHLayer(SMPLH):
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
-                               self.lbs_weights, pose2rot=False)
+                               self.lbs_weights, pose2rot=False,
+                               kin_tree_levels=self.kin_tree_levels)
 
         # Add any extra joints that might be needed
         joints = self.vertex_joint_selector(vertices, joints)
@@ -1375,6 +1387,7 @@ class SMPLX(SMPLH):
                                shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=pose2rot,
+                               kin_tree_levels=self.kin_tree_levels,
                                )
 
         lmk_faces_idx = self.lmk_faces_idx.unsqueeze(
@@ -1580,6 +1593,7 @@ class SMPLXLayer(SMPLX):
                                self.J_regressor, self.parents,
                                self.lbs_weights,
                                pose2rot=False,
+                               kin_tree_levels=self.kin_tree_levels,
                                )
 
         lmk_faces_idx = self.lmk_faces_idx.unsqueeze(
@@ -1822,6 +1836,7 @@ class MANO(SMPL):
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=True,
+                               kin_tree_levels=self.kin_tree_levels,
                                )
 
         # # Add pre-selected extra joints that might be needed
@@ -1891,7 +1906,8 @@ class MANOLayer(MANO):
         vertices, joints = lbs(betas, full_pose, self.v_template,
                                self.shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
-                               self.lbs_weights, pose2rot=False)
+                               self.lbs_weights, pose2rot=False,
+                               kin_tree_levels=self.kin_tree_levels)
 
         if self.joint_mapper is not None:
             joints = self.joint_mapper(joints)
@@ -2230,6 +2246,7 @@ class FLAME(SMPL):
                                shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=pose2rot,
+                               kin_tree_levels=self.kin_tree_levels,
                                )
 
         lmk_faces_idx = self.lmk_faces_idx.unsqueeze(
@@ -2381,6 +2398,7 @@ class FLAMELayer(FLAME):
                                shapedirs, self.posedirs,
                                self.J_regressor, self.parents,
                                self.lbs_weights, pose2rot=False,
+                               kin_tree_levels=self.kin_tree_levels,
                                )
 
         lmk_faces_idx = self.lmk_faces_idx.unsqueeze(
